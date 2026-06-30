@@ -1,6 +1,6 @@
 # SharePoint On-Prem Sync Client — Product & Engineering Instruction
 
-**Working name:** DataDrive (an open-source OneDrive replacement for on-premise SharePoint)
+**Working name:** DatamDrive (an open-source OneDrive replacement for on-premise SharePoint)
 **Status:** Plan / instruction — not yet implemented
 **Author:** CEO-review session, 2026-06-30
 **Decisions locked:** True desktop sync client · Electron + Node/TypeScript · NTLM/Kerberos auth first · SharePoint 2016 / 2019 / Subscription Edition · Open-source
@@ -76,7 +76,7 @@ regardless of what the UI shows.
 ## 3. Architecture
 
 ```
-┌─────────────────────────── Electron App (DataDrive) ───────────────────────────┐
+┌─────────────────────────── Electron App (DatamDrive) ───────────────────────────┐
 │                                                                                 │
 │  RENDERER (React, reuse portal/ components)        MAIN PROCESS (Node)          │
 │  ┌──────────────────────────────┐                 ┌───────────────────────────┐ │
@@ -306,7 +306,7 @@ it a true sync client. Phase 3 makes it *feel* like OneDrive.
 
 - A domain user installs the app, enters a site URL, authenticates via Windows SSO (no password stored).
 - They pick two libraries; one they can edit, one they can only read.
-- Both appear under a local DataDrive folder; the read-only one rejects local edits with a clear message.
+- Both appear under a local DatamDrive folder; the read-only one rejects local edits with a clear message.
 - Editing a file in Word and saving uploads a new version to SharePoint; version history is intact.
 - Editing the same file in two places produces a "keep both" conflict copy — no data lost.
 - Deleting a file locally moves it to the SharePoint Recycle Bin.
