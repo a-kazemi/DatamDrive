@@ -71,6 +71,15 @@ Site Collection (root web)
 Hidden nodes are invisible to the user. The visible tree is the accessible tree.
 Visible-but-locked is deferred to a later phase if requested by users.
 
+**Permission re-check (mid-session):** `EffectiveBasePermissions` is evaluated at tree
+enumeration time. To handle mid-session permission changes (admin revokes or grants access
+while the app is running), a background task re-evaluates permissions for all synced libraries
+every 5 minutes. If a library's permission level changes:
+- RW → RO: switch to read-only mount; surface Actionable tray notification; pending uploads are cancelled.
+- RW or RO → Hidden: pause sync for that library; surface Actionable notification.
+- RO → RW: switch to two-way mount; begin accepting uploads.
+The 5-minute re-check interval is not configurable in v1.
+
 **Read-only enforcement:** The local file remains writable on disk (no NTFS ACL changes —
 those would require admin rights). Enforcement is at the upload layer: if `permission_level =
 'ro'` for a dirty file, the upload is refused, and the user gets a tray notification:
@@ -99,8 +108,8 @@ One `better-sqlite3` database at `%APPDATA%\DataDrive\state.db`. Schema:
 ```sql
 CREATE TABLE sync_items (
   id               INTEGER PRIMARY KEY,
-  server_url       TEXT NOT NULL UNIQUE,   -- SP serverRelativeUrl
-  local_path       TEXT NOT NULL,          -- absolute local path
+  server_url       TEXT UNIQUE,           -- SP serverRelativeUrl; NULL until first upload succeeds
+  local_path       TEXT NOT NULL UNIQUE,  -- absolute local path (unique per row; enables pre-upload tracking)
   sp_item_id       INTEGER,               -- SP list item numeric ID; nullable; see Delete Behavior for null fallback
   etag             TEXT,                   -- SP ETag at last sync
   sp_version       INTEGER,               -- SP list item version number
@@ -111,16 +120,23 @@ CREATE TABLE sync_items (
   permission_level TEXT DEFAULT 'rw'      -- 'rw' | 'ro' | 'hidden'
 );
 
+-- Index for chokidar lookup (local_path → server_url per file event)
+CREATE INDEX idx_sync_items_local_path ON sync_items(local_path);
+
 CREATE TABLE libraries (
   id            INTEGER PRIMARY KEY,
   site_url      TEXT NOT NULL,
   list_id       TEXT NOT NULL UNIQUE,
   title         TEXT NOT NULL,
-  local_root    TEXT NOT NULL,            -- local folder this library maps to
+  local_root    TEXT NOT NULL UNIQUE,     -- local folder this library maps to; UNIQUE prevents two libraries sharing a folder
   change_token  TEXT,                     -- current GetChanges token
   last_polled   INTEGER                   -- Unix epoch ms of last poll
 );
 ```
+
+**Row lifecycle for locally-created files:** When chokidar fires `add` for a new local file, immediately insert a row with `server_url = NULL, dirty = 1`. On upload success, `UPDATE` the row with the `server_url`. This makes new-file rows visible to the startup dirty-row scan even if the app crashes before upload completes.
+
+**Setup wizard validation:** Before saving a new library, validate that `local_root` is not already in use by another library (the UNIQUE constraint is the enforcement layer; the UI check is the UX layer).
 
 Recovery on DB loss or corruption: rebuild from SharePoint on next launch. A missing DB
 triggers a full re-enumerate and re-download (Phase 1 path). Dirty-flag loss means local
@@ -137,23 +153,53 @@ on an interval.
 **Polling loop (per library, runs in main process):**
 ```
 1. Load stored change_token from libraries table.
-2. Call: POST /_api/web/lists('<list-id>')/GetChanges
-   Body: { query: { ChangeTokenStart: <token>, Add: true, Update: true, Delete: true,
-                    Item: true, File: true, Folder: true } }
+2. If change_token is NULL (first poll or expiry reset): run INITIAL ENUMERATE (below).
+   Otherwise: call GetChanges with the stored token (DELTA POLL).
 3. For each changed item in response:
    - Resolve serverRelativeUrl → local_path via sync_items table.
    - Apply download/upload/delete logic (see pipeline below).
 4. Persist new ChangeToken from response to libraries.change_token.
-5. Sleep <interval>. Repeat.
+5. Sleep <interval> with per-library random jitter (0–5s). Repeat.
 ```
 
-**First poll (no stored token):** pass `ChangeTokenStart: null` — SP returns all current
-items. This is the initial populate-from-remote step. During initial sync for a library, no
-conflict is possible (no prior `sync_items` row exists) — download wins unconditionally.
+**INITIAL ENUMERATE (first sync or after token expiry reset):**
+```
+1. GET /_api/web/lists('<list-id>')/CurrentChangeToken → save as pending_token
+2. GET /_api/web/lists('<list-id>')/items?$select=...&$top=1000
+   Repeat with $skiptoken until no more pages.
+3. For each item: insert sync_items row (download if not present locally).
+4. After last page: set libraries.change_token = pending_token captured in step 1.
+5. Transition to DELTA POLL on next tick.
+```
 
-**Initial sync concurrency:** when the user adds multiple libraries, initial syncs run
+**DELTA POLL:**
+```
+POST /_api/web/lists('<list-id>')/GetChanges
+Body: { query: { ChangeTokenStart: <stored_token>,
+                 Add: true, Update: true, Delete: true,
+                 Item: true, File: true, Folder: true } }
+```
+
+**Stale token recovery:** If GetChanges returns a stale-token error (SP exception indicating
+the change token has expired — default TTL is 60 days, configurable per farm), reset
+`libraries.change_token = NULL` and trigger INITIAL ENUMERATE on the next tick. Do NOT
+surface this as a user-facing error; it is transparent background recovery.
+
+Note: `ChangeTokenStart: null` behavior is SP-version-dependent (may return error or empty).
+Always use INITIAL ENUMERATE (enumerate-then-CurrentChangeToken) for the first sync. Spike A
+must explicitly test null-token behavior on SP 2016 and SP 2019.
+
+**Initial sync concurrency:** when the user adds multiple libraries, initial enumerates run
 per-library independently and in parallel, capped at 2 concurrent downloads. Libraries
-beyond the cap queue.
+beyond the cap queue. During initial sync, no conflict is possible (no prior `sync_items`
+row exists) — download wins unconditionally.
+
+**Polling concurrency:** steady-state delta polls are capped at 5 concurrent per app instance.
+Per-library jitter (0–5s random offset) prevents thundering-herd against the SP server.
+
+**429 / Retry-After handling:** if SP returns HTTP 429, parse the `Retry-After` header (seconds
+or HTTP-date) and sleep exactly that long before retrying. Do not apply the standard backoff
+on 429 — honor the server's signal. Log the throttle event at `warn` level.
 
 **Interval target:** 30 seconds per library by default. Configurable in settings (10s–5 min).
 See Open Questions for tuning guidance.
@@ -177,16 +223,23 @@ If both (1) and (2): **conflict**.
 
 **Resolution — "keep both" (default, never configurable away from this in v1):**
 ```
-1. Download the remote version → save as original filename (overwrite local).
-2. Rename the local version →
+1. Rename the local version FIRST →
      "<basename> (conflict — <username> — <YYYY-MM-DD>).<ext>"
    where <ext> = path.extname(filename) (last extension only)
    and <basename> = filename minus that extension.
    Example: "report.final.docx" → "report.final (conflict — jsmith — 2026-06-30).docx"
+   (Rename FIRST so the user's edits are safe before the remote version overwrites anything.)
+2. Download the remote version → save as original filename.
 3. Upload the renamed local version to SharePoint.
 4. Record both in sync_items with their respective etags and sp_item_ids.
 5. Notify user via tray: "Conflict in <filename> — both copies saved."
 ```
+
+**Crash safety:** If the process crashes after step 1 but before step 2, the user's local edit is
+preserved as the conflict-named copy and the original filename slot is empty. On restart, the
+polling loop re-downloads the remote to the original filename and re-queues the conflict copy
+upload. If it crashes after step 2 but before step 3, the remote is downloaded and the local
+conflict copy exists — on restart, the upload queue re-queues the conflict copy (dirty=1 row).
 
 The user resolves manually. DataDrive never silently loses data.
 
@@ -217,14 +270,16 @@ This is non-negotiable for the success criterion "delete is recoverable."
 
 Three tiers. Every error is classified at the point it occurs.
 
-| Tier | Description | User signal | Example |
+| Tier | Description | User signal | Examples |
 |------|-------------|-------------|---------|
 | **Transient** | Network blip, SP momentarily unavailable | Retry silently (exp. backoff) | TCP timeout, 503 |
-| **Actionable** | User must do something | Tray notification + activity log entry | 401 re-auth, disk full, conflict |
+| **Throttled** | SP returned HTTP 429 with Retry-After | Retry after Retry-After delay (not backoff) | 429 with `Retry-After: 30` |
+| **Actionable** | User must do something | Tray notification + activity log entry | 401 re-auth, disk full, conflict, file too large |
 | **Fatal** | Sync cannot continue | Tray error badge + modal on next open | DB corruption, SP site deleted, auth token permanently revoked |
 
-Transient errors retry with exponential backoff (1s, 2s, 4s, 8s, max 5 min). After 3
-consecutive fatal signals, sync pauses and the tray icon shows a red badge.
+Transient errors retry with exponential backoff (1s, 2s, 4s, 8s, max 5 min).
+Throttled (429) errors: parse the `Retry-After` header value and sleep that exact duration before retrying.
+After 3 consecutive fatal signals, sync pauses and the tray icon shows a red badge.
 
 No error is swallowed silently. Every error writes to the activity log.
 
@@ -268,6 +323,9 @@ One chokidar watcher per synced library, watching `libraries.local_root` recursi
 
 - **Watched paths:** `libraries.local_root` for each active library. Watching starts on app
   launch for each library and stops when a library is removed.
+- **local_root location:** must be on a local disk. Mapped network drives and UNC paths are
+  not supported for `local_root` in v1 — chokidar's FSEvents/ReadDirectoryChangesW may not
+  fire reliably on network paths. Warn the user during setup if a network path is detected.
 - **Symbolic links:** not followed. Symlinks inside a local_root are ignored.
 - **Exclusion patterns (never uploaded, never trigger sync):**
   - `~$*` — Office lock files (Word, Excel)
@@ -277,9 +335,25 @@ One chokidar watcher per synced library, watching `libraries.local_root` recursi
   - Any file or folder whose name starts with `.` (hidden system files)
 - **Debounce:** watcher events are debounced 500ms per path before entering the upload queue.
   Rapid saves (e.g., autosave in Word) produce one upload, not many.
+- **`add` event (new local file):** immediately INSERT a `sync_items` row with
+  `server_url = NULL, dirty = 1` before queuing the upload. This makes the file visible
+  to crash-recovery (startup dirty-row scan) even if the app exits before upload completes.
+- **Rename detection:** if the watcher emits `unlink` for path A and `add` for path B within
+  the same library within a 200ms window, treat as a rename. Use:
+  `POST /_api/web/GetFileByServerRelativeUrl('<src>')/MoveTo(newUrl='<dst>', flags=1)`
+  This preserves SP version history. If the window is missed (> 200ms), the rename is treated
+  as a delete + new upload (version history lost; acceptable rare edge case).
+- **Pre-upload size check:** before queuing any file for upload, check its size.
+  If size > 50 MB (configurable threshold in app settings), surface an Actionable error:
+  "file too large to sync — chunked upload coming in a future release. File is safe locally."
+  Log to activity log. Do not attempt the upload.
 - **New local subfolder (`addDir` event):** create the corresponding folder in SharePoint via
   `_api/web/folders` before uploading any files inside it. Do not upload files to a path
   whose parent folder does not yet exist on SP.
+- **Startup dirty-row scan:** on app launch, before starting watchers, run:
+  `SELECT * FROM sync_items WHERE dirty = 1`. For each row, add it to the upload queue.
+  This recovers both: (a) files edited before a crash, and (b) new files that were inserted
+  with `server_url = NULL` but never uploaded.
 - **local_root deleted:** if the user deletes the watched root folder itself, log a Fatal error,
   badge the tray, and pause sync for that library. Do not attempt to recreate the folder.
 
@@ -290,10 +364,21 @@ Node fetch adapter. `node-sp-auth` injects NTLM headers by wrapping `node-fetch`
 critical compatibility risk: does PnPjs v4's `@pnp/nodejs` adapter accept `node-sp-auth`'s
 fetch wrapper without conflict?
 
-This is a **required sub-item of Spike A** — not assumed safe. If the two fetch layers are
-incompatible, the fallback is: bypass PnPjs for auth and make raw `node-fetch` calls with
-`node-sp-auth` headers for NTLM, then pass authenticated cookies/tokens to a PnPjs
-`SPBrowser` context. The spike must confirm which path works.
+PnPjs v4 reorganized NTLM/SSO support in `@pnp/nodejs`. The wiring of `node-sp-auth` as a
+custom fetch client is non-trivial and is not documented by either project. Treat Spike A
+as "might not work" rather than "probably works with minor tweaks." If incompatible, the
+fallback is: bypass PnPjs entirely for SP calls — use raw `node-fetch` calls with
+`node-sp-auth` NTLM headers directly. This is a downgrade in ergonomics, not in correctness.
+
+This is a **required sub-item of Spike A** — not assumed safe. The spike must also explicitly
+test `ChangeTokenStart: null` against SP 2016 and SP 2019 to determine whether null token
+triggers a full-scan or an error (see Polling section — INITIAL ENUMERATE is the fallback).
+
+**Native addon note:** `node-sp-auth` uses `node-sspi` (a native C++ addon) for SSPI/Kerberos.
+`@electron/rebuild` (or `electron-rebuild`) must be run to recompile all native addons
+(node-sspi, better-sqlite3, and the cfapi addon) against Electron's Node ABI before packaging.
+This must be in the GitHub Actions workflow and the local dev setup. Without it, native addons
+load fine during development but crash in the distributed installer.
 
 ---
 
@@ -393,11 +478,22 @@ Full phase detail: see `Datam-Drive-Roadmap-Plan.md §7`.
 ## Distribution Plan
 
 - **Binary:** GitHub Releases. electron-builder produces a signed `.exe` (NSIS) and a portable
-  `.zip`. Auto-update via `electron-updater` — set up in the Phase 0/1 release pipeline.
+  `.zip`. Auto-update via `electron-updater` (see note below).
 - **Source:** MIT on GitHub. `npm install && npm run build` works on a fresh Windows machine in
   under 5 minutes. This must be verified before any public release.
-- **CI/CD:** GitHub Actions: lint → type-check → unit tests → electron-builder → draft GitHub
-  Release on tag. Target: push a tag, get a signed installer within 10 minutes.
+- **CI/CD:** GitHub Actions: lint → type-check → unit tests → `@electron/rebuild` → electron-builder
+  → draft GitHub Release on tag. Target: push a tag, get a signed installer within 10 minutes.
+- **Code signing:** Self-signed certificate for Phase 0–1 internal development. Acquire an OV or EV
+  code-signing certificate from a CA (DigiCert, Sectigo) before any public release. Store as
+  `WINDOWS_CERTIFICATE` (base64 PFX) and `WINDOWS_CERTIFICATE_PASSWORD` in GitHub Secrets.
+  EV certificate eliminates SmartScreen warnings; OV reduces but does not remove them on first-time
+  downloads. Self-signed: users see "Windows protected your PC" and must click "More info → Run anyway."
+  Add this instruction to the README for Phase 0–1.
+- **Auto-update:** `electron-updater` is included in the distribution pipeline. Auto-update is
+  **opt-in** and **off by default**. Users enable it in Settings. The update feed URL is configurable
+  (defaults to GitHub Releases; can be set to a self-hosted server for air-gapped deployments).
+  This ensures the app does not make outbound HTTPS calls to GitHub on startup without user consent —
+  required for air-gapped and data-sovereign organizations (the stated primary audience).
 - **Phase 4 (IT deployment):** Chocolatey package + winget manifest. These are Phase 4 items
   because they require a stable signed installer first.
 
@@ -412,17 +508,30 @@ Run BOTH spikes in parallel from Day 1. Auth and cfapi are independent.
 2. In main process: use `node-sp-auth` to authenticate via NTLM against a real on-prem SP
    2016 or 2019 farm.
 3. Try SSO path (existing Windows Kerberos ticket via SSPI) — confirm zero credentials stored.
-4. **Sub-item:** Verify `@pnp/sp` + `@pnp/nodejs` + `node-sp-auth`'s fetch wrapper work in
-   the same Node process without conflict. Call `_api/web` and enumerate libraries. Log result.
-5. **Sub-item (re-auth test):** Force an NTLM session expiry (wait for expiry, or call an
-   endpoint with an invalidated token) and verify the next request re-authenticates
-   automatically without manual intervention. Log the full HTTP exchange for both the initial
-   auth handshake and the re-auth. **Silent auth degradation is the failure mode** — the
-   first request may succeed but the second (after session lapse) may fail silently. This
-   sub-item catches that.
-6. Pass: authenticated call returns HTTP 200, library list loads, re-auth fires correctly.
-   Fail: document the exact failure point and identify the fix (e.g., bypass PnPjs fetch
-   chain, use raw node-fetch + node-sp-auth for all SP calls).
+4. **Sub-item (PnPjs compat):** Verify `@pnp/sp` + `@pnp/nodejs` + `node-sp-auth`'s fetch
+   wrapper work in the same Node process without conflict. Call `_api/web` and enumerate
+   libraries. Log result. If incompatible, fall back to raw `node-fetch` + `node-sp-auth`
+   for all SP calls (no PnPjs middleware).
+5. **Sub-item (re-auth test):** Force an NTLM session expiry and verify the next request
+   re-authenticates automatically without manual intervention. **Silent auth degradation is
+   the failure mode.** Log the full HTTP exchange.
+6. **Sub-item (null ChangeTokenStart test):** Test `GetChanges` with `ChangeTokenStart: null`
+   on both SP 2016 and SP 2019. If null token returns an error or empty response (instead of
+   full item list), the INITIAL ENUMERATE path (enumerate items + CurrentChangeToken) becomes
+   the canonical first-sync method for all SP versions. Document which versions accept null
+   and which require enumeration.
+7. Pass: authenticated call returns HTTP 200, library list loads, re-auth fires correctly,
+   initial sync method confirmed.
+   Fail: document exact failure point and fix.
+
+**Phase 0 setup (before spikes, run on Day 1):**
+- Initialize npm project + tsconfig for Electron + Node/TypeScript.
+- Run `@electron/rebuild` (or `electron-rebuild`) to verify native addon compilation
+  (node-sspi, better-sqlite3, cfapi). Add `electron-rebuild` script to `package.json`
+  and the GitHub Actions workflow. Without this, native addons work in dev but crash
+  in the packaged installer.
+- Scaffold Vitest config (`vitest.config.ts`) and Playwright config (`playwright.config.ts`)
+  with Electron support. All Phase 1+ code is written test-first.
 
 **Spike B: cfapi placeholder**
 1. Minimal `node-addon-api` C++ addon calling `CfRegisterSyncRoot` + `CfCreatePlaceholders`.
@@ -455,3 +564,79 @@ Electron without a proxy, and (b) whether Files-On-Demand is v1 or v2.
 
 Concrete output from the week: two short write-ups, one per spike. "It works / it doesn't,
 here's why, here's what we build next." Everything downstream depends on those two facts.
+
+---
+
+## Implementation Tasks
+
+Synthesized from /plan-eng-review findings. Each task derives from a specific finding.
+Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T1 (P1, human: ~2h / CC: ~10min)** — main/poller — Stale change token recovery
+  - Surfaced by: Architecture D1 — GetChanges stale token not handled
+  - Files: `main/poller/index.ts`, `main/db/libraries.ts`
+  - Verify: Go offline for simulated token TTL expiry; confirm re-enumerate fires, not error loop
+- [ ] **T2 (P1, human: ~1 day / CC: ~20min)** — main/watcher — Rename detection via paired unlink+add
+  - Surfaced by: Architecture D2 — rename severs SP version history
+  - Files: `main/watcher/index.ts`, `main/sp-client/operations.ts`
+  - Verify: Rename a file in Explorer; SP MoveTo called; version history intact in SP web UI
+- [ ] **T3 (P2, human: ~4h / CC: ~15min)** — main/poller — 5-min permission re-check background task
+  - Surfaced by: Architecture D3 — permissions not refreshed mid-session
+  - Files: `main/poller/permissions.ts`, `main/sync-engine/mount.ts`
+  - Verify: Admin revokes access; within 5min, library switches to RO, tray notification shown
+- [ ] **T4 (P1, human: ~1h / CC: ~5min)** — main/startup — Startup dirty-row scan
+  - Surfaced by: Architecture D4 — upload queue lost on crash
+  - Files: `main/startup/index.ts`, `main/db/sync-items.ts`
+  - Verify: Edit file, force-kill app, restart; file uploads on next launch without re-editing
+- [ ] **T5 (P1, human: ~2h / CC: ~10min)** — main/poller — Polling concurrency cap + 429 handling
+  - Surfaced by: Performance D7 — unbounded concurrency + missing 429/Retry-After
+  - Files: `main/poller/scheduler.ts`
+  - Verify: Add 20 libraries; confirm max 5 concurrent polls; inject 429 → sleep honors Retry-After
+- [ ] **T6 (P1, human: ~5min / CC: ~2min)** — main/db — local_path index
+  - Surfaced by: Performance D8 — full table scan on every chokidar event
+  - Files: `main/db/schema.ts`
+  - Verify: Schema migration creates `idx_sync_items_local_path`; `.schema` in sqlite3 confirms
+- [ ] **T7 (P1, human: ~30min / CC: ~5min)** — main/conflict — Fix conflict resolution step order
+  - Surfaced by: Cross-model D9 — original order destroys local edits on crash between steps 1-2
+  - Files: `main/conflict/resolver.ts`
+  - Verify: Kill process during conflict resolution; local edit (renamed copy) always survives
+- [ ] **T8 (P1, human: ~2h / CC: ~10min)** — main/poller — Initial sync: enumerate-then-CurrentChangeToken
+  - Surfaced by: Cross-model D10 — GetChanges(null) unreliable on SP 2016/2019
+  - Files: `main/poller/initial-sync.ts`
+  - Verify: Spike A tests null token explicitly; initial sync enumerates all items correctly
+- [ ] **T9 (P1, human: ~2h / CC: ~10min)** — main/db — server_url nullable + local_path UNIQUE
+  - Surfaced by: Cross-model D11 — new local files invisible to startup dirty-row scan
+  - Files: `main/db/schema.ts`, `main/watcher/index.ts`
+  - Verify: Create file while app is running, force-kill before upload; file re-uploaded on restart
+- [ ] **T10 (P2, human: ~2h / CC: ~10min)** — main/updater — Auto-update opt-in + configurable feed URL
+  - Surfaced by: Cross-model D12 — electron-updater breaks air-gapped deployments
+  - Files: `main/updater/index.ts`, `renderer/settings.tsx`
+  - Verify: Default Settings shows auto-update OFF; no outbound HTTPS to GitHub on startup
+- [ ] **T11 (P1, human: ~1h / CC: ~5min)** — build — @electron/rebuild in CI pipeline
+  - Surfaced by: Outside voice finding 4 — node-sspi and cfapi need ABI rebuild
+  - Files: `package.json`, `.github/workflows/release.yml`
+  - Verify: packaged installer loads node-sspi + better-sqlite3 without crashing
+- [ ] **T12 (P1, human: ~2h / CC: ~5min)** — main/watcher — Pre-upload file size guard (50MB)
+  - Surfaced by: Outside voice finding 8 — no size limit causes Electron OOM on large files
+  - Files: `main/watcher/upload-queue.ts`
+  - Verify: Drop a 200MB file into sync folder; Actionable error shown, no crash
+- [ ] **T13 (P1, human: ~1h / CC: ~5min)** — main/db — UNIQUE on libraries.local_root
+  - Surfaced by: D15 — two libraries same folder silently overwrite files
+  - Files: `main/db/schema.ts`, `renderer/setup-wizard.tsx`
+  - Verify: Attempt to add two libraries with same local_root; second is rejected with clear message
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Outside Voice | `/plan-eng-review` (Claude subagent) | Independent 2nd opinion | 1 | issues_found | 8 findings, all absorbed into main review |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 15 issues found, all resolved |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**VERDICT:** ENG CLEARED — all 15 findings resolved. Ready to implement Phase 0 spikes.
+
+NO UNRESOLVED DECISIONS
